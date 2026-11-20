@@ -12,6 +12,7 @@
 #include "qmi8658.hpp"
 #include "cube.hpp"
 #include "starfield.hpp"
+#include "plasma.hpp"
 
 // Embedded by CMake (embed_binary)
 extern "C" const uint8_t flash_img_bmp[], flash_img_bmp_end[];
@@ -68,35 +69,75 @@ static bool sleep_unless_tapped(QMI8658 &imu, uint32_t ms)
     return false;
 }
 
+// Runs an animation at the panel's refresh rate (faster frames would never be seen), drawing
+// into two framebuffers in turn so one is rendered while the other is sent by DMA. Prints the
+// frame rate once a second.
+class FrameLoop {
+public:
+    static constexpr int W = GC9107::WIDTH, H = GC9107::HEIGHT;
+
+    FrameLoop(GC9107 &lcd, const char *name)
+        : lcd_(lcd), name_(name), period_us_(1'000'000 / lcd.frame_rate()), next_(get_absolute_time()),
+          fps_start_(next_)
+    {
+    }
+    ~FrameLoop() { lcd_.wait(); }
+
+    // Waits until it's time for the next frame, then returns the framebuffer to draw it in
+    uint16_t *begin_frame()
+    {
+        sleep_until(next_);
+        next_ = delayed_by_us(next_, period_us_);
+        if (time_reached(next_)) // fell behind: don't try to catch up with a burst of frames
+            next_ = make_timeout_time_us(period_us_);
+        return buffers_[frames_ & 1]; // the other buffer may still be in flight
+    }
+
+    void end_frame(uint16_t *fb)
+    {
+        lcd_.show(fb); // waits for the previous frame's transfer before starting this one
+        frames_++;
+        const absolute_time_t now = get_absolute_time();
+        const int64_t elapsed = absolute_time_diff_us(fps_start_, now);
+        if (elapsed >= 1'000'000) {
+            printf("%s: %.1f fps\n", name_, (frames_ - fps_frames_) * 1e6f / elapsed);
+            fps_frames_ = frames_;
+            fps_start_ = now;
+        }
+    }
+
+private:
+    static inline uint16_t back_buffer_[W * H];
+    uint16_t *const buffers_[2] = {framebuffer, back_buffer_};
+    GC9107 &lcd_;
+    const char *name_;
+    const int64_t period_us_;
+    absolute_time_t next_, fps_start_;
+    uint frames_ = 0, fps_frames_ = 0;
+};
+
+static absolute_time_t end_time(uint32_t duration_ms)
+{
+    return duration_ms ? make_timeout_time_ms(duration_ms) : at_the_end_of_time;
+}
+
 // Wireframe cube that stays fixed in space as the board is turned, in front of a starfield.
-// Renders into two framebuffers in turn, so one is drawn while the other is being sent by DMA,
-// capped at the panel's refresh rate (faster frames would never be seen). Runs for duration_ms (0 = forever); returns true if it ended because of a tap.
+// Runs for duration_ms (0 = forever); returns true if it ended because of a tap.
 static bool cube_demo(GC9107 &lcd, QMI8658 &imu, uint32_t duration_ms)
 {
-    constexpr int W = GC9107::WIDTH, H = GC9107::HEIGHT;
     constexpr float DEG = float(M_PI / 180), ALPHA = 0.98f; // complementary filter: trust gyro short-term
-    static uint16_t back_buffer[W * H];
-    uint16_t *const buffers[2] = {framebuffer, back_buffer};
     static Starfield stars;
+    FrameLoop loop(lcd, "cube");
 
     float roll = 0, pitch = 0, yaw = 0;
-    bool first = true, was_tapped = false;
-    uint frames = 0, fps_frames = 0;
-    absolute_time_t last = get_absolute_time(), fps_start = last;
-    const absolute_time_t end = duration_ms ? delayed_by_ms(last, duration_ms) : at_the_end_of_time;
-    const int64_t frame_us = 1'000'000 / lcd.frame_rate();
-    absolute_time_t next_frame = last;
+    bool first = true;
+    absolute_time_t last = get_absolute_time();
+    const absolute_time_t end = end_time(duration_ms);
 
     while (!time_reached(end)) {
-        sleep_until(next_frame);
-        next_frame = delayed_by_us(next_frame, frame_us);
-        if (time_reached(next_frame)) // fell behind: don't try to catch up with a burst of frames
-            next_frame = make_timeout_time_us(frame_us);
-
-        if (tapped(imu)) {
-            was_tapped = true;
-            break;
-        }
+        uint16_t *fb = loop.begin_frame();
+        if (tapped(imu))
+            return true;
 
         const absolute_time_t now = get_absolute_time();
         const float dt = absolute_time_diff_us(last, now) * 1e-6f;
@@ -118,22 +159,36 @@ static bool cube_demo(GC9107 &lcd, QMI8658 &imu, uint32_t duration_ms)
         }
         stars.update(dt);
 
-        uint16_t *fb = buffers[frames & 1]; // the other buffer may still be in flight
-        std::fill_n(fb, W * H, rgb565::BLACK);
+        std::fill_n(fb, FrameLoop::W * FrameLoop::H, rgb565::BLACK);
         const View view = View::from_orientation(roll, pitch, yaw);
-        stars.draw(fb, W, H, view);
-        draw_wireframe_cube(fb, W, H, view);
-        lcd.show(fb); // waits for the previous frame's transfer before starting this one
-        frames++;
-
-        if (++fps_frames, absolute_time_diff_us(fps_start, now) >= 1'000'000) {
-            printf("cube: %.1f fps\n", fps_frames * 1e6f / absolute_time_diff_us(fps_start, now));
-            fps_frames = 0;
-            fps_start = now;
-        }
+        stars.draw(fb, FrameLoop::W, FrameLoop::H, view);
+        draw_wireframe_cube(fb, FrameLoop::W, FrameLoop::H, view);
+        loop.end_frame(fb);
     }
-    lcd.wait();
-    return was_tapped;
+    return false;
+}
+
+// Plasma effect; the LED follows the colour at the centre of the screen.
+// Runs for duration_ms (0 = forever); returns true if it ended because of a tap.
+static bool plasma_demo(GC9107 &lcd, QMI8658 &imu, WS2812 &led, uint32_t duration_ms)
+{
+    constexpr int W = FrameLoop::W, H = FrameLoop::H;
+    static Plasma plasma;
+    FrameLoop loop(lcd, "plasma");
+    const absolute_time_t start = get_absolute_time(), end = end_time(duration_ms);
+
+    while (!time_reached(end)) {
+        uint16_t *fb = loop.begin_frame();
+        if (tapped(imu)) {
+            led.off();
+            return true;
+        }
+        plasma.draw(fb, W, H, absolute_time_diff_us(start, get_absolute_time()) * 1e-6f);
+        led.set_rgb565(fb[(H / 2) * W + W / 2]);
+        loop.end_frame(fb);
+    }
+    led.off();
+    return false;
 }
 
 int main()
@@ -216,5 +271,9 @@ int main()
         // Then the IMU-driven cube; a tap here keeps it running
         if (!cube_mode && imu_ok)
             cube_mode = cube_demo(lcd, imu, 10'000);
+
+        // And the plasma; a tap here switches to the cube
+        if (!cube_mode)
+            cube_mode = plasma_demo(lcd, imu, led, 10'000);
     }
 }
