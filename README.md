@@ -10,7 +10,8 @@ Written by Claude Opus 5.5, though I wrote this README
     - Uses cmake and clever .incbin directive in assembly to directly include bitmap file specified in [CMakeLists.txt](CMakeLists.txt)
     - A "top down" RGB565 image can be blitted to the display directly without any conversion.
 - [X] WS2812 driver
-- [ ] IMU driver
+- [X] IMU driver - live updates a spinning cube / starfield
+    - tap the board to show this immediately (or keep showing it)
 - [ ] SD card driver
 
 ### Credits
