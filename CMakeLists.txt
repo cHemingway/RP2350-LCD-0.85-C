@@ -35,7 +35,7 @@ pico_sdk_init()
 
 # Add executable. Default name is the project name, version 0.1
 
-add_executable(display_demo display_demo.cpp gc9107.cpp bmp.cpp ws2812.cpp)
+add_executable(display_demo display_demo.cpp gc9107.cpp bmp.cpp ws2812.cpp qmi8658.cpp cube.cpp starfield.cpp)
 
 # Reuse the SDK's WS2812 PIO program (from pico_status_led)
 pico_generate_pio_header(display_demo ${PICO_SDK_PATH}/src/rp2_common/pico_status_led/ws2812.pio)
@@ -70,7 +70,8 @@ target_link_libraries(display_demo
         pico_stdlib
         hardware_spi
         hardware_dma
-        hardware_pio)
+        hardware_pio
+        hardware_i2c)
 
 # Add the standard include files to the build
 target_include_directories(display_demo PRIVATE
